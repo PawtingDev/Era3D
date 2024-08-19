@@ -9,6 +9,7 @@ instant-nsr-pl/runs/
 instant-nsr-pl/recon/
 sam_pt/
 MacLab-Era3D-512-6view/
+tmp/
 
 # data
 data_cleaning/
