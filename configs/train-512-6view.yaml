@@ -4,7 +4,7 @@ revision: null
 
 num_views: 6
 prompt_embeds_path: mvdiffusion/data/fixed_prompt_embeds_6view
-dataset_root_dir: /media/pawting/SN640/Datasets/wonder3d_dev/thuman2/ortho1_res1024_viewstep5
+dataset_root_dir: /root/autodl-tmp/ortho1_res1024_viewstep5
 train_dataset:
   prompt_embeds_path: ${prompt_embeds_path}
   root_dir: ${dataset_root_dir}
@@ -31,12 +31,12 @@ output_dir: 'tmp/debug'
 save_mode: 'rgba' # 'concat', 'rgba', 'rgb'
 seed: 42
 
-train_batch_size: 1
+train_batch_size: 4
 max_train_steps: 15000  # 20000
 untrainable_modules: ['regressor']
 gradient_accumulation_steps: 2
 gradient_checkpointing: true
-learning_rate: 1.e-5  # 5.e-5
+learning_rate: 5.e-5  # 5.e-5
 scale_lr: false
 lr_scheduler: "constant_with_warmup"
 lr_warmup_steps: 100
@@ -56,7 +56,7 @@ mixed_precision: "fp16"
 report_to: 'tensorboard'
 tracker_project_name: 'wonderhuman-directfinetune'
 local_rank: -1
-checkpointing_steps: 5000
+checkpointing_steps: 300
 checkpoints_total_limit: null
 last_global_step: 5000
 resume_from_checkpoint: latest

@@ -172,63 +172,103 @@ def log_validation(
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(cfg.seed)
 
-    images_cond, images_gt, images_pred = [], [], defaultdict(list)
-    for i, batch in enumerate(dataloader):
-        # (B, Nv, 3, H, W)
-        imgs_in, colors_out, normals_out = batch['imgs_in'], batch['imgs_out'], batch['normals_out']
+        images_cond, pred_cat = [], defaultdict(list)
+    for _, batch in tqdm(enumerate(dataloader)):
+        images_cond.append(batch['imgs_in'][:, 0]) 
+        imgs_in = torch.cat([batch['imgs_in']]*2, dim=0)
+        num_views = imgs_in.shape[1]
+        imgs_in = rearrange(imgs_in, "B Nv C H W -> (B Nv) C H W")# (B*Nv, 3, H, W)
 
-        # repeat  (2B, Nv, 3, H, W)
-        imgs_in = torch.cat([imgs_in] * 2, dim=0)
-        imgs_out = torch.cat([normals_out, colors_out], dim=0)
+        normal_prompt_embeddings, clr_prompt_embeddings = batch['normal_text_embeds'], batch['color_text_embeds'] 
+        prompt_embeddings = torch.cat([normal_prompt_embeddings, clr_prompt_embeddings], dim=0)
+        prompt_embeddings = rearrange(prompt_embeddings, "B Nv N C -> (B Nv) N C")
 
-        # (2B, Nv, Nce)
-        camera_embeddings = torch.cat([batch['camera_embeddings']] * 2, dim=0)
-
-        task_embeddings = torch.cat([batch['normal_task_embeddings'], batch['color_task_embeddings']], dim=0)
-
-        camera_task_embeddings = torch.cat([camera_embeddings, task_embeddings], dim=-1)
-
-        # (B*Nv, 3, H, W)
-        imgs_in, imgs_out = rearrange(imgs_in, "B Nv C H W -> (B Nv) C H W"), rearrange(imgs_out,
-                                                                                        "B Nv C H W -> (B Nv) C H W")
-        # (B*Nv, Nce)
-        camera_task_embeddings = rearrange(camera_task_embeddings, "B Nv Nce -> (B Nv) Nce")
-
-        images_cond.append(imgs_in)
-        images_gt.append(imgs_out)
         with torch.autocast("cuda"):
             # B*Nv images
             for guidance_scale in cfg.validation_guidance_scales:
-                out = pipeline(
-                    imgs_in, camera_task_embeddings, generator=generator, guidance_scale=guidance_scale,
-                    output_type='pt', num_images_per_prompt=1, **cfg.pipe_validation_kwargs
-                ).images
-                shape = out.shape
-                out0, out1 = out[:shape[0] // 2], out[shape[0] // 2:]
-                out = []
-                for ii in range(shape[0] // 2):
-                    out.append(out0[ii])
-                    out.append(out1[ii])
-                out = torch.stack(out, dim=0)
-                images_pred[f"{name}-sample_cfg{guidance_scale:.1f}"].append(out)
-    images_cond_all = torch.cat(images_cond, dim=0)
-    images_gt_all = torch.cat(images_gt, dim=0)
-    images_pred_all = {}
-    for k, v in images_pred.items():
-        images_pred_all[k] = torch.cat(v, dim=0)
+                unet_out = pipeline(
+                    imgs_in, None, prompt_embeds=prompt_embeddings,
+                    generator=generator, guidance_scale=guidance_scale, output_type='pt', num_images_per_prompt=1, 
+                    **cfg.pipe_validation_kwargs
+                )
+                
+                out = unet_out.images
+                bsz = out.shape[0] // 2
 
-    nrow = cfg.validation_grid_nrow
-    ncol = images_cond_all.shape[0] // nrow
-    images_cond_grid = make_grid(images_cond_all, nrow=nrow, ncol=ncol, padding=0, value_range=(0, 1))
-    images_gt_grid = make_grid(images_gt_all, nrow=nrow, ncol=ncol, padding=0, value_range=(0, 1))
-    images_pred_grid = {}
-    for k, v in images_pred_all.items():
-        images_pred_grid[k] = make_grid(v, nrow=nrow, ncol=ncol, padding=0, value_range=(0, 1))
-    save_image(images_cond_grid, os.path.join(save_dir, f"{global_step}-{name}-cond.jpg"))
-    save_image(images_gt_grid, os.path.join(save_dir, f"{global_step}-{name}-gt.jpg"))
-    for k, v in images_pred_grid.items():
-        save_image(v, os.path.join(save_dir, f"{global_step}-{k}.jpg"))
-    torch.cuda.empty_cache()
+                normals_pred = out[:bsz]
+                images_pred = out[bsz:] 
+                # print(normals_pred.shape, images_pred.shape)
+                pred_cat[f"cfg{guidance_scale:.1f}"].append(torch.cat([normals_pred, images_pred], dim=-1)) # b, 3, h, w
+                # cur_dir = os.path.join(save_dir, f"cropsize-{cfg.validation_dataset.crop_size}-cfg{guidance_scale:.1f}-seed{cfg.seed}")
+                cur_dir = save_dir 
+                os.makedirs(cur_dir, exist_ok=True)
+                if cfg.save_mode == 'concat': ## save concatenated color and normal---------------------
+                    for i in range(bsz//num_views):
+                        scene =  batch['filename'][i].split('.')[0]
+
+                        img_in_ = images_cond[-1][i].to(out.device)
+                        vis_ = [img_in_]
+                        for j in range(num_views):
+                            view = VIEWS[j]
+                            idx = i*num_views + j
+                            normal = normals_pred[idx]
+                            color = images_pred[idx]
+                           
+                            vis_.append(color)
+                            vis_.append(normal)
+
+                        out_filename = f"{cur_dir}/{scene}.png"
+                        vis_ = torch.stack(vis_, dim=0)
+                        vis_ = make_grid(vis_, nrow=len(vis_), padding=0, value_range=(0, 1))
+                        save_image(vis_, out_filename)
+                elif cfg.save_mode == 'rgb':
+                    for i in range(bsz//num_views):
+                        scene =  batch['filename'][i].split('.')[0]
+                        scene_dir = os.path.join(cur_dir, scene)
+                        os.makedirs(scene_dir, exist_ok=True)
+
+                        img_in_ = images_cond[-1][i].to(out.device)
+                        vis_ = [img_in_]
+                        for j in range(num_views):
+                            view = VIEWS[j]
+                            idx = i*num_views + j
+                            normal = normals_pred[idx]
+                            color = images_pred[idx]
+                            vis_.append(color)
+                            vis_.append(normal)
+
+                            ## save color and normal---------------------
+                            normal_filename = f"normals_{view}_masked.png"
+                            rgb_filename = f"color_{view}_masked.png"
+                            save_image(normal, os.path.join(scene_dir, normal_filename))
+                            save_image(color, os.path.join(scene_dir, rgb_filename))
+                elif cfg.save_mode == 'rgba':
+
+                    for i in range(bsz//num_views):
+                        scene =  "vis"
+                        scene_dir = os.path.join(cur_dir, scene)
+                        os.makedirs(scene_dir, exist_ok=True)
+
+                        img_in_ = images_cond[-1][i].to(out.device)
+                        vis_ = [img_in_]
+                        VIEWS = ['front', 'front_right', 'right', 'back', 'left', 'front_left']
+                        for j in range(num_views):
+                            view = VIEWS[j]
+                            idx = i*num_views + j
+                            normal = normals_pred[idx]
+                            color = images_pred[idx]
+                            vis_.append(color)
+                            vis_.append(normal)
+                            
+                            normal = convert_to_numpy(normal)
+                            color = convert_to_numpy(color)
+                            rm_normal = remove(normal)
+                            rm_color = remove(color)
+                            normal_filename = f"normals_{view}_masked.png"
+                            rgb_filename = f"color_{view}_masked.png"
+                            save_image_numpy(rm_normal, os.path.join(scene_dir, normal_filename))
+                            save_image_numpy(rm_color, os.path.join(scene_dir, rgb_filename))
+    torch.cuda.empty_cache()    
 
 
 def main(
@@ -758,23 +798,23 @@ def main(
                             # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                             ema_unet.store(unet.parameters())
                             ema_unet.copy_to(unet.parameters())
-                        log_validation(
-                                validation_dataloader,
-                                vae,
-                                feature_extractor,
-                                image_encoder,
-                                image_noising_scheduler,
-                                image_normalizer,
-                                tokenizer,
-                                text_encoder,
-                                unet,
-                                cfg,
-                                accelerator,
-                                weight_dtype,
-                                global_step,
-                                name="validation",
-                                save_dir=vis_dir
-                        )
+                        # log_validation(
+                        #         validation_dataloader,
+                        #         vae,
+                        #         feature_extractor,
+                        #         image_encoder,
+                        #         image_noising_scheduler,
+                        #         image_normalizer,
+                        #         tokenizer,
+                        #         text_encoder,
+                        #         unet,
+                        #         cfg,
+                        #         accelerator,
+                        #         weight_dtype,
+                        #         global_step,
+                        #         name="validation",
+                        #         save_dir=vis_dir
+                        # )
                         if cfg.use_ema:
                             # Switch back to the original UNet parameters.
                             ema_unet.restore(unet.parameters())
